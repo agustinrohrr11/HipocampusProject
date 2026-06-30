@@ -2,7 +2,7 @@
 
 ## Qué es Hippocampus
 
-Un gestor de memoria de alto rendimiento para LLMs — capa externa que se sienta entre el usuario y cualquier modelo de lenguaje, gestionando contexto de forma semántica e inteligente.
+Un gestor de memoria de alto rendimiento para LLMs — capa externa entre el usuario y cualquier modelo de lenguaje, que gestiona contexto de forma semántica e inteligente.
 
 Hippocampus no es un modelo. Es infraestructura.
 
@@ -15,30 +15,24 @@ usuario ←→ LLM grande (Claude, GPT, cualquier API)
               (gestor de memoria — corre local, gratis)
                     ↑
               SmolLM2-360M
-              (agente interno de Hippocampus —
-               procesa embeddings,
-               detecta cambios de tema,
-               indexa y recupera memorias)
+              (agente interno — embeddings,
+               detección de temas, índice, recuperación)
 ```
 
-**SmolLM2 nunca habla con el usuario.** Es el motor interno de Hippocampus — liviano, rápido, CPU-friendly, acceso total a embeddings. Hace el trabajo sucio de gestión semántica.
+- **SmolLM2 nunca habla con el usuario.** Es el motor interno: liviano, CPU-friendly, acceso total a embeddings.
+- **El LLM grande nunca gestiona memoria.** Recibe contexto ya curado. No sabe que Hippocampus existe. No consume tokens en gestión.
+- **Todo el trabajo de gestión corre local en CPU, gratis.** Solo se llama al LLM grande para responder.
 
-**El LLM grande nunca se ensucia las manos.** Recibe contexto ya curado, comprimido y relevante. No sabe que Hippocampus existe. No consume tokens en gestión de memoria.
-
-**Todo el trabajo de gestión corre local en CPU, gratis.** Detección, compresión, indexación y recuperación no cuestan tokens de API. Solo se llama al LLM grande para responder.
-
-## Por qué SmolLM2 como agente interno
-
-Los modelos grandes como Claude no exponen sus embeddings via API. SmolLM2-360M sí — y sus embeddings son suficientemente buenos para gestión semántica de memoria. Se usa como proxy de representación, no como modelo de razonamiento.
+**Por qué SmolLM2:** los modelos cerrados (Claude, GPT) no exponen embeddings vía API. SmolLM2 sí, y son suficientes como proxy semántico — no se usa como modelo de razonamiento.
 
 ## Filosofía de diseño
 
 - Hippocampus es un **colaborador**, no un oráculo
-- Si no encuentra una memoria con suficiente confianza, pregunta al usuario de forma natural — observa primero, pregunta solo cuando genuinamente no puede inferir
+- Si no encuentra una memoria con suficiente confianza, pregunta de forma natural — observa primero, pregunta solo cuando genuinamente no puede inferir
 - La incertidumbre no es un fallo — es información que dispara una interacción
 - Nunca inventar contexto que no existe
 - El usuario es parte del sistema de recuperación, no solo un input
-- El LLM grande recibe siempre contexto curado — nunca contexto saturado o redundante
+- El LLM grande recibe siempre contexto curado, nunca saturado
 
 ## Flujo general
 
@@ -47,7 +41,7 @@ conversación activa
         ↓
    SmolLM2 extrae embeddings (embed_tokens, sin forward pass)
         ↓
-   detección de cambio de tema
+   detección de cambio de tema (con zona de confianza)
         ↓
    chunk semántico → promedio de embeddings → nodo de memoria (.bin)
         ↓
@@ -70,34 +64,28 @@ embeddings = model.model.embed_tokens(inputs.input_ids)
 embeddings = model(**inputs, output_hidden_states=True).hidden_states[0]
 ```
 
-Los vectores crudos de `embed_tokens` capturan qué palabras son, sin contexto posicional. Para detección de tema es suficiente y más limpio — el contexto del transformer puede distorsionar la señal temática.
+Los vectores crudos capturan qué palabras son, sin contexto posicional. Para detección de tema es suficiente y más limpio — el contexto del transformer distorsiona la señal temática (última capa da similitud ~0.95 para todo).
 
-## Detección de cambio de tema
+## Detección de cambio de tema — estado actual
 
-Basada en datos reales con ground truth conocido — no en umbrales calibrados a mano.
+**Configuración vigente:** AND entre dos señales sobre chunks de 3 utterances (ventana no-solapada):
 
-Dataset de referencia: **DialSeg711** — 711 diálogos en inglés con cambios de tema anotados manualmente.
-
-```python
-from datasets import load_dataset
-dataset = load_dataset("Salesforce/dialogstudio", "DialSeg711")
+```
+cambio de tema SI:
+    distancia_coseno(chunk_actual, chunk_anterior) > 0.131
+    Y
+    hay content words nuevas en el chunk
 ```
 
-Señales a evaluar:
-- `sim_first3 × sim_media` — combinación actual, validada empíricamente
-- Marcadores de discurso explícitos — "by the way", "anyway", "moving on"
-- Aparición de sustantivos nuevos no presentes en chunk anterior
-- Cohesión léxica — caída en vocabulario compartido entre chunks
+Nota: el threshold 0.131 está en **distancia coseno** (`scipy.spatial.distance.cosine` = 1 − similitud), no en similitud directa.
 
-Metodología:
-1. Correr el detector sobre DialSeg711
-2. Comparar detecciones vs anotaciones reales
-3. Medir aciertos y fallos
-4. Iterar sobre señales hasta mejorar la métrica
+**Resultado en DialSeg711** (20 diálogos, matching ±1 posición): F1=0.658, P=0.507, R=0.937, FP=72, FN=5.
 
-Para evitar falsos positivos por topic drift:
-- Ventana de confirmación — N chunks consecutivos con similitud baja antes de declarar cambio
-- Vector de tema dominante — promedio ponderado de últimos N embeddings
+**Zona de confianza (consulta al usuario):** banda de ±0.05 alrededor del threshold. Dentro de la banda → pregunta natural al usuario en vez de decidir solo. Fuera de la banda → decide automáticamente. Con ±0.05: 22% de transiciones generan pregunta, 58.7% de acierto en las decisiones automáticas. Limitación conocida: ese 58.7% sigue siendo bajo: la banda ayuda pero no resuelve el problema de fondo del detector.
+
+**Decisión de alcance:** se cerró el research loop de afinar el detector contra DialSeg711. Las señales léxicas (cohesión, entidades, marcadores de discurso) tienen techo bajo en ese dataset porque es servicio al cliente transaccional, con alternancia user/agent constante y sin marcadores naturales de transición — no representa el caso de uso real de Hippocampus (conversaciones largas, técnicas, con tangentes).
+
+**Próximo paso de validación:** `conversacion_simulada.json` — conversación sintética en inglés de 50 turnos con boundaries anotados manualmente, que incluye un caso de topic drift real (tangente lateral sobre fermentación de levaduras que interrumpe y luego retoma el tema principal). Sirve para probar si el detector distingue una tangente de un cambio de tema permanente, algo que DialSeg711 no puede testear.
 
 ## Estructura del nodo
 
@@ -125,8 +113,8 @@ nodo {
 
 Opción C — arquitectura final, implementación incremental:
 
-- `embedding_promedio` — float16[N], promedio de embeddings del chunk. Se implementa primero.
-- `kv_cache` — placeholder vacío. Se implementa cuando el embedding promedio funcione.
+- `embedding_promedio` — float16[N], promedio de embeddings del chunk. Implementado.
+- `kv_cache` — placeholder vacío. Pendiente, se implementa cuando el embedding promedio esté validado en producción.
 
 ```python
 import numpy as np
@@ -137,9 +125,9 @@ embedding = np.load("memoria_001.bin")
 ## Estrategia de búsqueda dual
 
 - **Vectorial** — similitud coseno del query contra vector_resumen de cada nodo
-- **Navegación de grafo** — cuando hay contexto, recorrer punteros directamente
+- **Navegación de grafo** — cuando hay contexto, recorrer punteros directamente (más rápido y preciso que búsqueda vectorial cuando aplica)
 
-## Niveles de confianza
+## Niveles de confianza en recuperación
 
 ```
 alta   →  carga la memoria directamente
@@ -152,45 +140,33 @@ baja   →  "no encuentro el contexto, ¿me ayudás a ubicarlo?"
 - Ryzen 5 serie 5000, CPU-only, 8GB RAM
 - Agente interno: SmolLM2-360M
 - Stack: Python + HuggingFace Transformers + torch (CPU)
-- Compatible con cualquier LLM grande via API
+- Compatible con cualquier LLM grande vía API
 
 ## Estado
 
 - [x] Arquitectura conceptual y roles definidos
-- [x] Estructura del nodo
-- [x] Detección de cambio de tema — metodología definida
-- [x] Búsqueda dual
 - [x] Filosofía de diseño
+- [x] Estructura del nodo
 - [x] Formato del .bin — Opción C, incremental
 - [x] Fix de embeddings — embed_tokens sin forward pass
-- [ ] Evaluación contra DialSeg711
+- [x] Detección de cambio de tema — evaluado contra DialSeg711, F1=0.658
+- [x] Zona de confianza para consultas al usuario — ±0.05 calibrado
+- [x] Conversación simulada en inglés creada (conversacion_simulada.json)
+- [ ] Evaluar detector contra conversacion_simulada.json
 - [ ] Índice en RAM
 - [ ] Navegación de grafo
-- [ ] Integración con LLM grande via API
+- [ ] Integración con LLM grande vía API
+- [ ] Versión en español
 
-## Pendientes conceptuales
+## Limitaciones conocidas
 
-- Umbral de similitud coseno para detección de cambio de tema
-- N para ventana de confirmación de topic drift
+**Granularidad de chunks por utterances, no por tokens.** La ventana fija de 3 utterances funciona en DialSeg711 porque los mensajes son de longitud uniforme. En conversaciones reales con mensajes muy largos o muy cortos puede fallar — un mensaje largo mezcla subtemas en un embedding promedio difuso, mensajes muy cortos no tienen suficiente contenido semántico. Solución propuesta, pendiente de calibrar: acumular utterances hasta llegar a N tokens (rango típico en literatura: 50-150) en vez de un número fijo de mensajes.
 
-## Limitaciones conocidas y pendientes de investigación
+**Acierto automático bajo incluso fuera de la zona de confianza (58.7%).** La banda reduce las preguntas innecesarias pero no resuelve que el detector de base siga siendo poco confiable. Pendiente de revisar con datos más representativos del uso real (ver conversacion_simulada.json).
 
-### Granularidad de chunks — mensajes de longitud variable
+**DialSeg711 no representa el caso de uso real.** Es útil como benchmark estandarizado y comparable con literatura, pero es diálogo transaccional corto. La validación real debe hacerse contra conversaciones largas y técnicas como las que Hippocampus va a procesar en producción.
 
-La ventana fija de 3 utterances funciona bien en DialSeg711 porque los mensajes tienen longitud relativamente uniforme. En conversaciones reales con mensajes de longitud muy variable puede fallar:
-
-- Mensaje largo (200 palabras) → embedding promedio difuso, mezcla subtemas
-- Mensajes muy cortos ("ok", "sí", "entiendo") → poco contenido semántico para promediar
-
-**Solución propuesta:** chunk por tokens, no por utterances.
-
-```
-chunk = acumular utterances hasta llegar a N tokens
-```
-
-Así un mensaje largo forma su propio chunk y varios mensajes cortos se agrupan hasta tener suficiente contenido semántico. Rango típico en literatura: 50-150 tokens por chunk. Pendiente de calibrar contra DialSeg711.
-
-## Resultados de evaluación — detección de cambio de tema
+## Historial de exploración — señales de detección evaluadas
 
 Dataset: DialSeg711, 20 diálogos, ventana no-solapada=3 utterances, matching ±1 posición.
 
@@ -205,8 +181,4 @@ Dataset: DialSeg711, 20 diálogos, ventana no-solapada=3 utterances, matching ±
 | + Promedio CW + Ent (AND) | 0.641 | 0.484 | 0.949 | 80 | 4 |
 | + OR interno (AND) | 0.637 | 0.490 | 0.911 | 75 | 7 |
 
-**Configuración ganadora:** Content words nuevas (AND) — F1=0.658, primera vez Precision >0.5.
-
-**Decisión:** integrar content words nuevas al pipeline y cerrar el research loop de detección. El detector es funcional para avanzar a la siguiente etapa. Los FP residuales se manejarán con la consulta colaborativa al usuario cuando la confianza sea baja.
-
-**Límite alcanzado:** señales léxicas no pueden resolver completamente el ruido por alternancia usuario/agente. Mejoras futuras requieren señales más sofisticadas o más datos de entrenamiento.
+Señales descartadas tras evaluación: discourse markers solos no aportan en este dataset (~3.4% de cobertura). Score combinado multiplicativo (sim × jaccard, en ambas direcciones) probado y descartado — peor que el filtro AND simple. Cohesión léxica sola tiene techo bajo porque comparte stopwords entre chunks de cualquier tema.
